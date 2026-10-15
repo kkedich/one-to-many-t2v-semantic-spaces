@@ -1,0 +1,53 @@
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+    - id: check-ast
+    - id: check-yaml
+    - id: end-of-file-fixer
+    - id: trailing-whitespace
+    - id: requirements-txt-fixer
+- repo: https://github.com/PyCQA/isort  # Organized imports
+  rev: 6.0.1
+  hooks:
+    - id: isort
+      name: isort
+      entry: isort
+      types: [python]
+- repo: https://github.com/hhatto/autopep8  # Reformats code
+  rev: v2.3.2
+  hooks:
+    - id: autopep8
+      name: autopep8
+      entry: autopep8 --max-line-length 100 --recursive --in-place
+      types: [python]
+- repo: https://github.com/PyCQA/flake8  # Style checking (consider for stricter teams)
+  rev: 7.3.0
+  hooks:
+    - id: flake8
+      name: flake8
+      entry: flake8 --ignore E501,W503,W504
+      types: [python]
+- repo: https://github.com/PyCQA/pylint  # Code analysis
+  rev: v3.3.8
+  hooks:
+    - id: pylint
+      entry: pylint --rcfile=.pylintrc --errors-only --disable=E1101,E0401,E0611
+      types: [python]
+- repo: https://github.com/nbQA-dev/nbQA
+  rev: 1.9.1
+  hooks:
+    - id: nbqa-isort
+      entry: nbqa isort --profile=black
+      types_or:
+        - jupyter
+    - id: nbqa-black
+      entry: nbqa black --line-length=100
+      types_or:
+        - jupyter
+    - id: nbqa-pylint
+      entry: nbqa pylint --rcfile=.pylintrc --errors-only --disable=E1101,E0401,E1123,E0611,E0601,E0602
+      language: python
+      require_serial: true
+      types_or:
+        - jupyter
