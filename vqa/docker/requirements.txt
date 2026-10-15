@@ -1,0 +1,8 @@
+cmake
+# To run sonnet with the I3D model we need to use this version
+# Check if only sonnet 1.26 is usable for us
+dm-sonnet==1.26
+scikit-learn # for kvd
+scipy
+# required for sonnet
+wrapt

@@ -1,0 +1,325 @@
+"""
+This script has the goal of evaluating the generated videos in inference using our
+current VQA metrics.
+
+Steps:
+- Perform forward pass of the model
+- Get metrics on generated videos
+"""
+
+import argparse
+import datetime
+import logging
+import numpy as np
+import os
+import random
+import tensorflow as tf
+from pathlib import Path
+
+from text2video.dataset.data_builder import build_dataset
+from text2video.metrics.iqa.base import IQAMetrics
+from text2video.models.builder import build_opt
+from text2video.models.vae_ops import reparameterization_trick
+from text2video.models.video.builder_video_components import create_generator
+from text2video.report.report_utils import (dict_to_markdown_table,
+                                            images_to_markdown_strings)
+from text2video.trainer.checkpoint import video_ae_checkpoint_restore
+from text2video.trainer.forward_video import forward_enc_dec_model
+from text2video.utils.config import Config, ConfigDict
+from text2video.utils.config_gpu import init_gpu
+from text2video.viewer.embeddings import plot_embeddings
+from text2video.viewer.viewer import overview_experiment
+
+
+def parse_args():
+    """Argument parsing function"""
+    parser = argparse.ArgumentParser(description="Test the Video 3D Conv model (encoder and decoder separated")
+    parser.add_argument(
+        "experiment_path",
+        help="Model and train configuration folder where the configuration is available.")
+    parser.add_argument(
+        "dataset", help="Configuration file for the dataset")
+    parser.add_argument(
+        "--output_path", type=str, default=None,
+        help="Path to save the predictions.")
+    parser.add_argument(
+        "--gpu_id", type=str, default=None,
+        help="GPU ID to execute the experiment")
+    args = parser.parse_args()
+
+    return args
+
+
+def inference(dataset_variables, models, testing_options,
+              dir_experiment, save_output=True, videos_to_show=3):
+
+    print("\nStarting inference...")
+    test_video_dataset = dataset_variables["test"]["dataset"]
+    nb_samples_per_epoch = dataset_variables["test"]["nb_samples_per_epoch"]
+
+    dir_output_gt = dir_experiment / "gt"
+    dir_output_pred = dir_experiment / "pred"
+    dir_output_codes = dir_experiment / "codes"
+
+    if save_output:
+        dir_output_gt.mkdir(parents=True, exist_ok=True)
+        dir_output_pred.mkdir(parents=True, exist_ok=True)
+        dir_output_codes.mkdir(parents=True, exist_ok=True)
+
+    testing_options.iqa.initialize_metrics()
+    all_video_codes = None
+
+    videos_indexes = random.sample(range(nb_samples_per_epoch), videos_to_show)
+    print(f"Video indexes: {videos_indexes}, nb_samples_per_epoch: {nb_samples_per_epoch}")
+    samples_path = []
+
+    for batch, input_data in enumerate(test_video_dataset):
+        _, _, video_code, decoded_video = forward_enc_dec_model(
+            input_data,
+            models["video_encoder"],
+            models["video_decoder"],
+            training=False,
+            options=testing_options,
+        )
+
+        if video_code is not None:
+            video_code_reshaped = video_code
+            if len(video_code.shape) > 2:
+                logging.debug(
+                    f"Video code will be reshaped to dimension 2. Current shape: {video_code.shape}")
+                output_dimension = tf.math.reduce_prod(tf.shape(video_code)[1:])
+                video_code_reshaped = tf.reshape(video_code, [-1, output_dimension])
+
+            if all_video_codes is None:
+                all_video_codes = video_code_reshaped
+            else:
+                all_video_codes = np.vstack((all_video_codes, video_code_reshaped))
+
+        if batch % 100 == 0:
+            print(f"Current inference batch: {batch}/{nb_samples_per_epoch}")
+            if all_video_codes is not None:
+                print(f"Current all_video_codes: {all_video_codes.shape}")
+
+        if batch in videos_indexes:
+            print(f"Generating visual sample of batch <{batch}>")
+            output_sample = dir_experiment / f"sample_video_{batch}.png"
+            current_samples_path = overview_experiment(
+                decoded_video,
+                input_data,
+                videos_to_show=1,
+                batch_index=None,
+                grayscale=True if testing_options.channels == 1 else False,
+                filename_prefix=output_sample
+            )
+            print(f"Adding sample at <{current_samples_path}>")
+            samples_path.extend(current_samples_path)
+
+        if save_output:
+            # Save decoded video and other features into .npy
+            np.save(dir_output_gt / f"{batch}_gt.npy", input_data)
+            np.save(dir_output_pred / f"{batch}_pred.npy", decoded_video)
+            if video_code is not None:
+                np.save(dir_output_codes / f"{batch}_code.npy", video_code)
+
+        # Calculating IQA metrics
+        testing_options.iqa.compute(input_data, decoded_video)
+
+    result_per_metric = testing_options.iqa.result()
+
+    return result_per_metric, all_video_codes, samples_path
+
+
+def create_models(cfg_experiment, batch_size):
+    # For now, only works with baseline approach
+
+    print("Creating model...")
+    # Creating the generator and disc. models
+    options = cfg_experiment.model_video
+    # Common parameters
+    options_generator = options.generator
+    options_generator.momentum_bn = 0.9
+    options_generator.input = options.input
+    options_generator.batch_size = batch_size
+    options_generator.using_strategy = False
+
+    # Create the models
+    original_video_encoder, video_decoder = create_generator(
+        name="baseline", options=options_generator)
+    # Mean and sigma from distribution
+    z_mu, z_log_var = original_video_encoder.output
+    video_code = reparameterization_trick(z_mu, z_log_var)
+
+    video_encoder = tf.keras.Model(
+        inputs=[original_video_encoder.input],
+        outputs=[z_mu, z_log_var, video_code],
+        name="encoder_wae"
+    )
+    video_encoder.summary()
+
+    video_encoder.compiled_metrics = None
+    video_decoder.compiled_metrics = None
+
+    generator_optimizer = build_opt(cfg_experiment.model_video.generator.optimizer)
+
+    models = {
+        "video_encoder": video_encoder,
+        "video_decoder": video_decoder,
+    }
+    optimizers = {
+        "generator": generator_optimizer
+    }
+    print("Creating model: OK\n")
+
+    return models, optimizers
+
+
+def main():
+    """Main function of the evaluation/inference script"""
+    args = parse_args()
+
+    # Load config file
+    dir_experiment_input = Path(args.experiment_path)
+    cfg_experiment = Config(args.experiment_path + "/cfg_experiment.py")
+    cfg_dataset = Config(args.dataset)
+    print(f"Loading experiment from <{dir_experiment_input}>")
+
+    # GPU is set on CUDA_VISIBLE_DEVICES, so id is always 0
+    if args.gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+        os.environ["WORLD_SIZE"] = "1"
+
+    init_gpu([0])
+
+    dir_experiment_output = Path(args.output_path)
+    if not dir_experiment_output.exists():
+        dir_experiment_output.mkdir(parents=True, exist_ok=True)
+
+    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    logging.basicConfig(
+        filename=f"{dir_experiment_output}/test_video_{current_time}.log", level=logging.DEBUG)
+    logging.info("\nStarting the testing of the video model")
+    logging.info(f"Output directory: <{dir_experiment_output}>")
+
+    # Read TEST dataset
+    print("Creating test dataset...")
+    batch_size = cfg_experiment.test_cfg.batch_size
+    dataset_variables, channels = build_dataset(
+        sequence_length=cfg_experiment.model_video.input.sequence_length,
+        img_height=cfg_experiment.model_video.input.img_height,
+        img_width=cfg_experiment.model_video.input.img_width,
+        channels=cfg_experiment.model_video.input.channels,
+        cfg_dataset=cfg_dataset.cfg,
+        split="test",
+        using_text=False,
+        batch_size=batch_size,
+    )
+    print("Creating test dataset: OK\n")
+
+    # Load pre-trained model
+    # Loading the generator model
+    print("Creating model...")
+    if cfg_experiment.model_video.input.channels != channels:
+        # Follow channels from dataset, if available
+        cfg_experiment.model_video.input.channels = channels
+
+    # Load models: video encoder and decoder
+    models, optimizers = create_models(cfg_experiment, batch_size)
+
+    print("Restoring model...")
+    ckpt_generator = tf.train.Checkpoint(
+        step=tf.Variable(1),
+        optimizer=optimizers["generator"],
+        video_encoder=models["video_encoder"],
+        video_decoder=models["video_decoder"]
+    )
+
+    print(f"Dir experiment input: {dir_experiment_input}, type: {type(dir_experiment_input)}")
+    ckpt_path = dir_experiment_input / "checkpoints/generator_full/"
+    if not ckpt_path.exists():
+        raise ValueError(f"Checkpoint path does not exist: <{ckpt_path}>")
+
+    gen_manager = tf.train.CheckpointManager(
+        ckpt_generator,
+        directory=ckpt_path,
+        max_to_keep=3,
+        checkpoint_name="ckpt_video_generator_full_"
+    )
+
+    video_ae_checkpoint_restore(
+        None,
+        gen_manager,
+        None,
+        ckpt_generator,
+        None,
+    )
+    print("Restoring OK.\n")
+
+    # Calculate IQA metrics
+    testing_options = ConfigDict()
+    testing_options.video_model_name = cfg_experiment.model_video.generator.get(
+        "name", "baseline")
+    testing_options.iqa = IQAMetrics(device="cuda", default=False)
+    testing_options.channels = channels
+
+    # Run inference on the test set
+    result_per_metric, all_video_codes, samples_path = \
+        inference(
+            dataset_variables,
+            models,
+            testing_options,
+            dir_experiment_output
+        )
+    print(f"Results per metric: {result_per_metric}")
+
+    embeddings_plot_str = "Model without embeddings =("
+    if all_video_codes is not None:
+        print(f"Generates <{all_video_codes.shape}> video code shape.")
+
+        # Generate plot of video code embeddings
+        plot_path = f"{str(dir_experiment_output)}/plot_testing.png"
+        plot_embeddings(
+            [all_video_codes],
+            height=5, width=10, numpy_version=True,
+            output_path=plot_path,
+            scale=True,
+            distributions=["video_code"],
+            colors=["b"],
+            put_id_on_points=False
+        )
+
+        embeddings_plot_str = f"<img src='{Path(plot_path).name}' alt='Embeddings plot'>"
+
+    # Generate report on Markdown
+    markdown_table = dict_to_markdown_table(result_per_metric)
+    markdown_string_samples = images_to_markdown_strings(samples_path)
+
+    print("\nVideo samples:")
+    print(markdown_string_samples)
+
+    markdown_string = f'''
+# Inference Results
+
+This is the inference results for the video generator model.
+
+- Checkpoint: `{ckpt_path}`
+- Dataset: `{args.dataset}`
+- Config: `{cfg_experiment}`
+
+## Metrics results
+
+{markdown_table}
+
+## Embeddings
+
+{embeddings_plot_str}
+
+## Samples from testing set
+'''
+
+    markdown_string += markdown_string_samples
+    with open(f"{str(dir_experiment_output)}/report.md", "w", encoding="utf-8") as f:
+        f.write(markdown_string)
+
+
+if __name__ == '__main__':
+    main()

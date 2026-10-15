@@ -1,0 +1,33 @@
+#--extra-index-url https://download.pytorch.org/whl/cu118 # https://download.pytorch.org/whl/cpu  # for torch related packages
+addict
+av # To generate the UCF101 dataset
+dists-pytorch # perceptual metric
+# Unet3D from VDM
+#rotary-embedding-tensorflow
+einops==0.8.1
+#einops-exts
+lpips # perceptual metric
+markdown
+MarkupSafe>=2.0  # for DISTS
+moviepy
+mpmath<1.4,>=1.1.0  # for DISTS
+natsort
+numpy
+pandas
+pillow
+psutil
+scikit-image # Check if we will maintain this here or in the base image
+scikit-learn
+seaborn
+setuptools>=40.8.0  # for DISTS
+#tensorflow-addons
+tabulate
+tensorflow-hub==0.15.0
+tensorflow-probability
+# Torch related
+torch
+torchvision
+transformers # Models from HuggingFace
+umap-learn
+wget
+yapf==0.40.1 # To format config.py files https://github.com/open-mmlab/mmdetection/issues/10962
